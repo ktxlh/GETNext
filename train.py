@@ -9,6 +9,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+import scipy.sparse as sp
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import OneHotEncoder
@@ -139,9 +140,17 @@ def train(args):
     X[:, num_cats + 1 :] = raw_X[:, 2:]
     logging.info(f"After one hot encoding poi cat, X.shape: {X.shape}")
 
+    # Print how sparse raw_A is
+    total_elements = raw_A.shape[0] * raw_A.shape[1]
+    nonzero_elements = raw_A.count_nonzero()
+    logging.info(
+        f"Adjacency matrix sparsity: {nonzero_elements}/{total_elements} "
+        f"({nonzero_elements / total_elements:.6f}) non-zero elements."
+    )
+
     # Normalization
     print("Laplician matrix...")
-    A = calculate_laplacian_matrix(raw_A, mat_type="hat_rw_normd_lap_mat")
+    A = calculate_laplacian_matrix(raw_A)
 
     # POI id to index
     nodes_df = pd.read_csv(args.data_node_feats)
@@ -276,11 +285,36 @@ def train(args):
 
     # %% ====================== Build Models ======================
     # Model1: POI embedding model
+    # Convert X (always dense) to torch tensor
     if isinstance(X, np.ndarray):
         X = torch.from_numpy(X)
-        A = torch.from_numpy(A)
+
+    # Handle adjacency: calculate_laplacian_matrix may return a scipy sparse CSR or dense ndarray
+    A_sparse_torch = None
+
+    # If A is a scipy sparse matrix, convert to torch sparse_coo_tensor for GCN
+    if sp.issparse(A):
+        A_csr = A.tocsr()
+        A_coo = A_csr.tocoo()
+        indices = torch.LongTensor(np.vstack((A_coo.row, A_coo.col)))
+        values = torch.FloatTensor(A_coo.data)
+        A_sparse_torch = torch.sparse_coo_tensor(
+            indices, values, size=A_coo.shape
+        ).coalesce()
+    else:
+        # dense numpy array / matrix
+        A_dense_np = np.array(A)
+        # create sparse torch tensor as well for GCN (optional)
+        A_coo = sp.coo_matrix(A_dense_np)
+        indices = torch.LongTensor(np.vstack((A_coo.row, A_coo.col)))
+        values = torch.FloatTensor(A_coo.data)
+        A_sparse_torch = torch.sparse_coo_tensor(
+            indices, values, size=A_coo.shape
+        ).coalesce()
+
+    # Move tensors to device and set dtype
     X = X.to(device=args.device, dtype=torch.float)
-    A = A.to(device=args.device, dtype=torch.float)
+    A_sparse_torch = A_sparse_torch.to(device=args.device, dtype=torch.float)
 
     args.gcn_nfeat = X.shape[1]
     poi_embed_model = GCN(
@@ -391,17 +425,56 @@ def train(args):
         return input_seq_embed
 
     def adjust_pred_prob_by_graph(y_pred_poi):
-        y_pred_poi_adjusted = torch.zeros_like(y_pred_poi)
-        attn_map = node_attn_model(X, A)
+        """Adjust logits using sparse edge-based attention without dense NxN maps."""
+        # Compute sparse attention on edges
+        attn_sparse = node_attn_model(X, A_sparse_torch)  # sparse [N, N]
 
-        for i in range(len(batch_seq_lens)):
-            traj_i_input = batch_input_seqs[i]  # list of input check-in pois
-            for j in range(len(traj_i_input)):
-                y_pred_poi_adjusted[i, j, :] = (
-                    attn_map[traj_i_input[j], :] + y_pred_poi[i, j, :]
-                )
+        # Build padded index tensor for input POIs
+        idx_tensors = [torch.LongTensor(seq) for seq in batch_input_seqs]
+        if len(idx_tensors) == 0:
+            return y_pred_poi
 
-        return y_pred_poi_adjusted
+        batch_input_idx = pad_sequence(
+            idx_tensors, batch_first=True, padding_value=-1
+        ).to(device=args.device)
+        valid_mask = batch_input_idx != -1
+        if not valid_mask.any():
+            return y_pred_poi
+
+        # Flatten valid positions and their coordinates
+        pos_bt = valid_mask.nonzero(as_tuple=False)  # [K, 2]
+        srcs = batch_input_idx[valid_mask]  # [K]
+
+        # CSR-like grouping of edges by source
+        idx = attn_sparse.indices()  # [2, E]
+        vals = attn_sparse.values()  # [E]
+        src_idx = idx[0]
+        dst_idx = idx[1]
+
+        num_nodes = X.shape[0]
+        counts = torch.bincount(src_idx, minlength=num_nodes)
+        rowptr = torch.empty(num_nodes + 1, dtype=torch.long, device=counts.device)
+        rowptr[0] = 0
+        torch.cumsum(counts, dim=0, out=rowptr[1:])
+
+        unique_srcs = torch.unique(srcs)
+        for s in unique_srcs.tolist():
+            s = int(s)
+            start = rowptr[s].item()
+            end = rowptr[s + 1].item()
+            if start == end:
+                continue
+            dests = dst_idx[start:end]
+            w = vals[start:end]
+
+            mask_s = srcs == s
+            bt_list = pos_bt[mask_s]
+            for k in range(bt_list.size(0)):
+                b = bt_list[k, 0]
+                t = bt_list[k, 1]
+                y_pred_poi[b, t].index_add_(0, dests, w)
+
+        return y_pred_poi
 
     # %% ====================== Train ======================
     poi_embed_model = poi_embed_model.to(device=args.device)
@@ -442,7 +515,7 @@ def train(args):
             batch_seq_labels_time = []
             batch_seq_labels_cat = []
 
-            poi_embeddings = poi_embed_model(X, A)
+            poi_embeddings = poi_embed_model(X, A_sparse_torch)
 
             # Convert input seq to embeddings
             for sample in batch:
@@ -526,7 +599,7 @@ def train(args):
             batch_seq_labels_time = []
             batch_seq_labels_cat = []
 
-            poi_embeddings = poi_embed_model(X, A)
+            poi_embeddings = poi_embed_model(X, A_sparse_torch)
 
             # Convert input seq to embeddings
             for sample in batch:
@@ -586,7 +659,7 @@ def train(args):
             best_loss = loss
 
             # Save poi embeddings
-            poi_embeddings = poi_embed_model(X, A).detach().cpu()
+            poi_embeddings = poi_embed_model(X, A_sparse_torch).detach().cpu()
             embeddings = {
                 idx: poi_embeddings[idx] for idx in range(len(poi_embeddings))
             }
@@ -604,7 +677,7 @@ if __name__ == "__main__":
 
     set_seed()
 
-    args.data_adj_mtx = f"dataset/{args.city}/graph_A.csv"
+    args.data_adj_mtx = f"dataset/{args.city}/graph_A.npz"
     args.data_node_feats = f"dataset/{args.city}/graph_X.csv"
 
     run = wandb.init(

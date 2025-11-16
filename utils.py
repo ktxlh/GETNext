@@ -5,12 +5,13 @@ import re
 from pathlib import Path
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 import torch.backends.cudnn as cudnn
 from scipy.sparse.linalg import eigsh
 
 
-def fit_delimiter(string='', length=80, delimiter="="):
+def fit_delimiter(string="", length=80, delimiter="="):
     result_len = length - len(string)
     half_len = math.floor(result_len / 2)
     result = delimiter * half_len + string + delimiter * half_len
@@ -30,11 +31,13 @@ def zipdir(path, ziph, include_format):
         for file in files:
             if os.path.splitext(file)[-1] in include_format:
                 filename = os.path.join(root, file)
-                arcname = os.path.relpath(os.path.join(root, file), os.path.join(path, '..'))
+                arcname = os.path.relpath(
+                    os.path.join(root, file), os.path.join(path, "..")
+                )
                 ziph.write(filename, arcname)
 
 
-def increment_path(path, exist_ok=True, sep=''):
+def increment_path(path, exist_ok=True, sep=""):
     # Increment path, i.e. runs/exp --> runs/exp{sep}0, runs/exp{sep}1 etc.
     path = Path(path)  # os-agnostic
     if (path.exists() and exist_ok) or (not path.exists()):
@@ -56,37 +59,60 @@ def get_normalized_features(X):
     return X, means, stds
 
 
-def calculate_laplacian_matrix(adj_mat, mat_type):
+def calculate_laplacian_matrix(adj_mat, mat_type="hat_rw_normd_lap_mat"):
+    """Calculate laplacian / normalized adjacency matrix.
+
+    Supports sparse input (scipy.sparse.csr_matrix) and dense NumPy arrays.
+    For sparse input the function returns a sparse matrix (CSR). For dense
+    input it returns a NumPy matrix/array as before.
+
+    Currently only the 'hat_rw_normd_lap_mat' type (used by GCNConv) is
+    implemented for sparse inputs. Other types raise ValueError.
+    """
+    # Sparse path
+    if sp.issparse(adj_mat):
+        n_vertex = adj_mat.shape[0]
+
+        if mat_type == "hat_rw_normd_lap_mat":
+            # wid_adj = A + I
+            wid_adj = adj_mat + sp.eye(n_vertex, format="csr")
+
+            # degree vector of wid_adj (row-sum)
+            deg = np.asarray(wid_adj.sum(axis=1)).reshape(-1)
+
+            # avoid division by zero (shouldn't happen because of +I)
+            deg[deg == 0] = 1.0
+
+            inv_deg = 1.0 / deg
+            D_inv = sp.diags(inv_deg, format="csr")
+
+            # hat_rw_normd_lap_mat = D_inv * wid_adj
+            hat = D_inv.dot(wid_adj).tocsr()
+            return hat
+        else:
+            raise ValueError(
+                f"mat_type '{mat_type}' is not implemented for sparse input"
+            )
+
+    # Dense path (existing behavior)
     n_vertex = adj_mat.shape[0]
 
     # row sum
     deg_mat_row = np.asmatrix(np.diag(np.sum(adj_mat, axis=1)))
-    # column sum
-    # deg_mat_col = np.asmatrix(np.diag(np.sum(adj_mat, axis=0)))
     deg_mat = deg_mat_row
 
     adj_mat = np.asmatrix(adj_mat)
     id_mat = np.asmatrix(np.identity(n_vertex))
 
-    if mat_type == 'com_lap_mat':
-        # Combinatorial
-        com_lap_mat = deg_mat - adj_mat
-        return com_lap_mat
-    elif mat_type == 'wid_rw_normd_lap_mat':
-        # For ChebConv
-        rw_lap_mat = np.matmul(np.linalg.matrix_power(deg_mat, -1), adj_mat)
-        rw_normd_lap_mat = id_mat - rw_lap_mat
-        lambda_max_rw = eigsh(rw_lap_mat, k=1, which='LM', return_eigenvectors=False)[0]
-        wid_rw_normd_lap_mat = 2 * rw_normd_lap_mat / lambda_max_rw - id_mat
-        return wid_rw_normd_lap_mat
-    elif mat_type == 'hat_rw_normd_lap_mat':
-        # For GCNConv
+    if mat_type == "hat_rw_normd_lap_mat":
         wid_deg_mat = deg_mat + id_mat
         wid_adj_mat = adj_mat + id_mat
-        hat_rw_normd_lap_mat = np.matmul(np.linalg.matrix_power(wid_deg_mat, -1), wid_adj_mat)
+        hat_rw_normd_lap_mat = np.matmul(
+            np.linalg.matrix_power(wid_deg_mat, -1), wid_adj_mat
+        )
         return hat_rw_normd_lap_mat
     else:
-        raise ValueError(f'ERROR: {mat_type} is unknown.')
+        raise ValueError(f"mat_type '{mat_type}' is unknown.")
 
 
 def maksed_mse_loss(input, target, mask_value=-1):
@@ -121,17 +147,17 @@ def mAP_metric(y_true_seq, y_pred_seq, k):
 
 
 def MRR_metric(y_true_seq, y_pred_seq):
-    """Mean Reciprocal Rank: Reciprocal of the rank of the first relevant item """
+    """Mean Reciprocal Rank: Reciprocal of the rank of the first relevant item"""
     rlt = 0
     for y_true, y_pred in zip(y_true_seq, y_pred_seq):
-        rec_list = y_pred.argsort()[-len(y_pred):][::-1]
+        rec_list = y_pred.argsort()[-len(y_pred) :][::-1]
         r_idx = np.where(rec_list == y_true)[0][0]
         rlt += 1 / (r_idx + 1)
     return rlt / len(y_true_seq)
 
 
 def top_k_acc_last_timestep(y_true_seq, y_pred_seq, k):
-    """ next poi metrics """
+    """next poi metrics"""
     y_true = y_true_seq[-1]
     y_pred = y_pred_seq[-1]
     top_k_rec = y_pred.argsort()[-k:][::-1]
@@ -143,7 +169,7 @@ def top_k_acc_last_timestep(y_true_seq, y_pred_seq, k):
 
 
 def mAP_metric_last_timestep(y_true_seq, y_pred_seq, k):
-    """ next poi metrics """
+    """next poi metrics"""
     # AP: area under PR curve
     # But in next POI rec, the number of positive sample is always 1. Precision is not well defined.
     # Take def of mAP from Personalized Long- and Short-term Preference Learning for Next POI Recommendation
@@ -158,11 +184,11 @@ def mAP_metric_last_timestep(y_true_seq, y_pred_seq, k):
 
 
 def MRR_metric_last_timestep(y_true_seq, y_pred_seq):
-    """ next poi metrics """
+    """next poi metrics"""
     # Mean Reciprocal Rank: Reciprocal of the rank of the first relevant item
     y_true = y_true_seq[-1]
     y_pred = y_pred_seq[-1]
-    rec_list = y_pred.argsort()[-len(y_pred):][::-1]
+    rec_list = y_pred.argsort()[-len(y_pred) :][::-1]
     r_idx = np.where(rec_list == y_true)[0][0]
     return 1 / (r_idx + 1)
 

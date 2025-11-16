@@ -17,24 +17,37 @@ class NodeAttnMap(nn.Module):
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
         self.leakyrelu = nn.LeakyReLU(0.2)
 
-    def forward(self, X, A):
-        Wh = torch.mm(X, self.W)
+    def forward(self, X, A_sparse):
+        """Compute attention values only on edges in A (sparse).
 
-        e = self._prepare_attentional_mechanism_input(Wh)
+        Returns a sparse attention matrix with the same sparsity pattern
+        as A_sparse. Values are leakyrelu(a_l^T Wh_i + a_r^T Wh_j) scaled by
+        (A_ij + 1) to mirror the previous implementation's shift and multiply.
+        """
+        assert A_sparse.is_sparse, "Expected A_sparse to be a torch sparse tensor"
 
-        if self.use_mask:
-            e = torch.where(A > 0, e, torch.zeros_like(e))  # mask
+        Wh = torch.mm(X, self.W)  # [N, H]
+        a_l = self.a[: self.out_features, :]  # [H, 1]
+        a_r = self.a[self.out_features :, :]  # [H, 1]
 
-        A = A + 1  # shift from 0-1 to 1-2
-        e = e * A
+        # Edge indices
+        idx = A_sparse.coalesce().indices()  # [2, E]
+        vals = A_sparse.coalesce().values()  # [E]
+        src = idx[0]
+        dst = idx[1]
 
-        return e
+        e_left = torch.matmul(Wh, a_l).squeeze(-1)  # [N]
+        e_right = torch.matmul(Wh, a_r).squeeze(-1)  # [N]
+        e_vals = self.leakyrelu(e_left[src] + e_right[dst])  # [E]
 
-    def _prepare_attentional_mechanism_input(self, Wh):
-        Wh1 = torch.matmul(Wh, self.a[: self.out_features, :])
-        Wh2 = torch.matmul(Wh, self.a[self.out_features :, :])
-        e = Wh1 + Wh2.T
-        return self.leakyrelu(e)
+        # Scale by (A + 1) elementwise on edges to mimic previous behavior
+        e_vals = e_vals * (vals + 1.0)
+
+        # Build sparse attention tensor
+        attn_sparse = torch.sparse_coo_tensor(
+            idx, e_vals, size=A_sparse.shape, device=A_sparse.device
+        )
+        return attn_sparse.coalesce()
 
 
 class GraphConvolution(nn.Module):
