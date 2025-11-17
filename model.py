@@ -147,7 +147,11 @@ class FuseEmbeddings(nn.Module):
         self.leaky_relu = nn.LeakyReLU(0.2)
 
     def forward(self, user_embed, poi_embed):
-        x = self.fuse_embed(torch.cat((user_embed, poi_embed), 0))
+        if user_embed.dim() == 1:
+            concat = torch.cat((user_embed, poi_embed), dim=0)
+        else:
+            concat = torch.cat((user_embed, poi_embed), dim=-1)
+        x = self.fuse_embed(concat)
         x = self.leaky_relu(x)
         return x
 

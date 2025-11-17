@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 from tqdm import tqdm
+import time
 
 import random
 import numpy as np
@@ -72,6 +73,36 @@ def train(args):
         torch.backends.cuda.enable_math_sdp(True)
     step = 0
     best_loss = float("inf")
+    grad_value_clip = getattr(args, "clip_grad_value", None)
+    timing_log_interval = getattr(args, "timing_log_interval", 1)
+    timing_stage_names = [
+        "batch_total",
+        "poi_embedding",
+        "sequence_build",
+        "forward_loss",
+        "backward_clip",
+        "optimizer_step",
+    ]
+
+    def _reset_timing_stats():
+        return {name: 0.0 for name in timing_stage_names}
+
+    def _emit_timing_stats(timing_stats, timing_window_count, step_idx):
+        if timing_window_count == 0:
+            return timing_stats, timing_window_count
+        avg_stats = {
+            name: timing_stats[name] / timing_window_count
+            for name in timing_stage_names
+        }
+        avg_msg = " | ".join(
+            f"{name}:{avg_stats[name] * 1000:.2f}ms" for name in timing_stage_names
+        )
+        wandb_metrics = {
+            f"timing/{name}_ms": avg_stats[name] * 1000 for name in timing_stage_names
+        }
+        run.log(wandb_metrics, step=step_idx)
+        return _reset_timing_stats(), 0
+
     args.save_dir = increment_path(
         Path(args.project) / args.name, exist_ok=args.exist_ok, sep="-"
     )
@@ -395,40 +426,33 @@ def train(args):
         # User to embedding
         user_id = traj_id.split("_")[0]
         user_idx = user_id2idx_dict[user_id]
-        input = torch.LongTensor([user_idx]).to(device=args.device)
-        user_embedding = user_embed_model(input)
-        user_embedding = torch.squeeze(user_embedding)
+        user_idx_tensor = torch.tensor([user_idx], device=args.device)
+        user_embedding = user_embed_model(user_idx_tensor).squeeze(0)
 
-        # POI to embedding and fuse embeddings
-        input_seq_embed = []
-        for idx in range(len(input_seq)):
-            poi_embedding = poi_embeddings[input_seq[idx]]
-            poi_embedding = torch.squeeze(poi_embedding).to(device=args.device)
+        if not input_seq:
+            return torch.empty(0, args.seq_input_embed, device=args.device)
 
-            # Time to vector
-            time_embedding = time_embed_model(
-                torch.tensor([input_seq_time[idx]], dtype=torch.float).to(
-                    device=args.device
-                )
-            )
-            time_embedding = torch.squeeze(time_embedding).to(device=args.device)
+        poi_idx_tensor = torch.tensor(input_seq, dtype=torch.long, device=args.device)
+        poi_seq_embeddings = poi_embeddings.index_select(0, poi_idx_tensor)
 
-            # Categroy to embedding
-            cat_idx = torch.LongTensor([input_seq_cat[idx]]).to(device=args.device)
-            cat_embedding = cat_embed_model(cat_idx)
-            cat_embedding = torch.squeeze(cat_embedding)
+        time_tensor = torch.tensor(
+            input_seq_time, device=args.device, dtype=torch.float
+        )
+        time_tensor = time_tensor.unsqueeze(-1)  # [seq_len, 1]
+        time_embeddings = time_embed_model(time_tensor)
 
-            # Fuse user+poi embeds
-            fused_embedding1 = embed_fuse_model1(user_embedding, poi_embedding)
-            fused_embedding2 = embed_fuse_model2(time_embedding, cat_embedding)
+        cat_idx_tensor = torch.tensor(
+            input_seq_cat, dtype=torch.long, device=args.device
+        )
+        cat_embeddings = cat_embed_model(cat_idx_tensor)
 
-            # Concat time, cat after user+poi
-            concat_embedding = torch.cat((fused_embedding1, fused_embedding2), dim=-1)
+        user_expanded = user_embedding.unsqueeze(0).expand(
+            poi_seq_embeddings.size(0), -1
+        )
+        fused_embedding1 = embed_fuse_model1(user_expanded, poi_seq_embeddings)
+        fused_embedding2 = embed_fuse_model2(time_embeddings, cat_embeddings)
 
-            # Save final embed
-            input_seq_embed.append(concat_embedding)
-
-        return input_seq_embed
+        return torch.cat((fused_embedding1, fused_embedding2), dim=-1)
 
     # %% ====================== Train ======================
     poi_embed_model = poi_embed_model.to(device=args.device)
@@ -456,8 +480,11 @@ def train(args):
         # Mask will be (re)built per-batch using actual seq_len
         src_mask = None
         # Loop batch
+        timing_stats = _reset_timing_stats()
+        timing_window_count = 0
         pbar = tqdm(train_loader, desc="Training", ncols=80)
         for batch in pbar:
+            batch_start = time.perf_counter()
             # Build inputs and masks from the batch's actual sequence length
 
             # Assert no nan in batch
@@ -481,8 +508,11 @@ def train(args):
             batch_seq_labels_time = []
             batch_seq_labels_cat = []
 
+            embed_start = time.perf_counter()
             poi_embeddings = poi_embed_model(X, A_sparse_torch)
+            poi_embedding_elapsed = time.perf_counter() - embed_start
 
+            build_start = time.perf_counter()
             # Convert input seq to embeddings
             for sample in batch:
                 # sample[0]: traj_id, sample[1]: input_seq, sample[2]: label_seq
@@ -493,9 +523,7 @@ def train(args):
                 label_seq_time = [each[1] for each in sample[2]]
                 label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
                 # input_seq_embed shape: [seq_len, embed_dim]
-                input_seq_embed = torch.stack(
-                    input_traj_to_embeddings(sample, poi_embeddings), dim=0
-                )
+                input_seq_embed = input_traj_to_embeddings(sample, poi_embeddings)
                 batch_seq_embeds.append(input_seq_embed)
                 batch_seq_lens.append(len(input_seq))
                 batch_input_seqs.append(input_seq)
@@ -520,6 +548,7 @@ def train(args):
 
             # Build key padding mask: True where all features are padding (-1)
             pad_mask = (batch_padded == -1).all(dim=2)  # [batch, seq]
+            sequence_build_elapsed = time.perf_counter() - build_start
 
             # Skip batch if everything is padded across all targets (avoids NaN losses)
             has_poi = (label_padded_poi != -1).any().item()
@@ -532,6 +561,9 @@ def train(args):
             if not (has_poi or has_time or has_cat):
                 # Nothing to learn in this batch
                 continue
+
+            timing_stats["poi_embedding"] += poi_embedding_elapsed
+            timing_stats["sequence_build"] += sequence_build_elapsed
 
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
@@ -559,6 +591,7 @@ def train(args):
             if torch.isnan(src_mask).any():
                 raise ValueError("NaN detected in src_mask.")
 
+            forward_start = time.perf_counter()
             y_pred_poi, y_pred_time, y_pred_cat = seq_model(
                 x, src_mask, key_padding_mask
             )
@@ -607,8 +640,11 @@ def train(args):
             else:
                 loss_cat = flat_pred_cat.new_tensor(0.0)
 
+            timing_stats["forward_loss"] += time.perf_counter() - forward_start
+
             # Final loss
             loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
+            backward_start = time.perf_counter()
             optimizer.zero_grad()
             try:
                 loss.backward()
@@ -639,10 +675,14 @@ def train(args):
                         int(key_padding_mask.sum().item()),
                     )
                 raise
-            # Additional clipping by value as an extra safety guard
-            torch.nn.utils.clip_grad_value_(trainable_params, clip_value=5.0)
+            if grad_value_clip is not None:
+                # Optional clipping by value if configured
+                torch.nn.utils.clip_grad_value_(
+                    trainable_params, clip_value=grad_value_clip
+                )
             # Clip gradients to avoid rare spikes causing NaNs
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            timing_stats["backward_clip"] += time.perf_counter() - backward_start
 
             # Check gradients for debugging
             params_with_nan_grad = []
@@ -655,12 +695,24 @@ def train(args):
                     f"After backward: NaN detected in gradient of parameter: {params_with_nan_grad}"
                 )
 
+            optim_start = time.perf_counter()
             optimizer.step()
+            timing_stats["optimizer_step"] += time.perf_counter() - optim_start
+
+            timing_stats["batch_total"] += time.perf_counter() - batch_start
+            timing_window_count += 1
+            if timing_window_count >= timing_log_interval:
+                timing_stats, timing_window_count = _emit_timing_stats(
+                    timing_stats, timing_window_count, step
+                )
 
             step += 1
             run.log({"train/loss": loss.item()}, step=step)
             pbar.set_postfix({"loss": loss.item()})
         pbar.close()
+        timing_stats, timing_window_count = _emit_timing_stats(
+            timing_stats, timing_window_count, step
+        )
         # train end --------------------------------------------------------------------------------------------------------
 
         # If no val data, directly save embeddings and skip val
@@ -706,9 +758,7 @@ def train(args):
                 input_seq_time = [each[1] for each in sample[1]]
                 label_seq_time = [each[1] for each in sample[2]]
                 label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
-                input_seq_embed = torch.stack(
-                    input_traj_to_embeddings(sample, poi_embeddings)
-                )
+                input_seq_embed = input_traj_to_embeddings(sample, poi_embeddings)
                 batch_seq_embeds.append(input_seq_embed)
                 batch_seq_lens.append(len(input_seq))
                 batch_input_seqs.append(input_seq)
