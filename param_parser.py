@@ -73,7 +73,7 @@ def parameter_parser():
     parser.add_argument(
         "--time-loss-weight",
         type=int,
-        default=10,
+        default=1,
         help="Scale factor for the time loss term",
     )
     parser.add_argument(
@@ -92,12 +92,6 @@ def parameter_parser():
         "--lr", type=float, default=0.001, help="Initial learning rate."
     )
     parser.add_argument(
-        "--lr-scheduler-factor",
-        type=float,
-        default=0.1,
-        help="Learning rate scheduler factor",
-    )
-    parser.add_argument(
         "--weight_decay",
         type=float,
         default=5e-4,
@@ -105,18 +99,6 @@ def parameter_parser():
     )
 
     # Experiment config
-    parser.add_argument(
-        "--save-weights",
-        action="store_true",
-        default=True,
-        help="whether save the model",
-    )
-    parser.add_argument(
-        "--save-embeds",
-        action="store_true",
-        default=False,
-        help="whether save the embeddings",
-    )
     parser.add_argument(
         "--workers", type=int, default=4, help="Num of workers for dataloader."
     )
@@ -129,12 +111,6 @@ def parameter_parser():
     )
     parser.add_argument(
         "--no-cuda", action="store_true", default=False, help="Disables CUDA training."
-    )
-    parser.add_argument(
-        "--mode", type=str, default="client", help="python console use only"
-    )
-    parser.add_argument(
-        "--port", type=int, default=64973, help="python console use only"
     )
     parser.add_argument("--city", type=str)
     parser.add_argument("--train_ratio", type=float, default=0.8)

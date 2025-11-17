@@ -54,7 +54,22 @@ def worker_init_fn(worker_id):
     torch.manual_seed(worker_seed)
 
 
+def datetime_to_float(dt, min_time, max_time):
+    """
+    Normalize the datetime object to a float in the range [0, 1].
+    """
+    if max_time == min_time:
+        return 0.0  # Avoid division by zero if all timestamps are the same
+    return (dt - min_time) / (max_time - min_time)
+
+
 def train(args):
+    torch.autograd.set_detect_anomaly(True)
+    if torch.cuda.is_available():
+        # Disable flash/memory-efficient attention kernels; fall back to math for stability
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
     step = 0
     best_loss = float("inf")
     args.save_dir = increment_path(
@@ -94,21 +109,8 @@ def train(args):
     train_df = check_ins.iloc[:num_train].reset_index(drop=True)
     val_df = check_ins.iloc[num_train:].reset_index(drop=True)
 
-    TIME_ZERO = train_df["arrival_time"].min()
-
-    def datetime_to_float(dt_series) -> pd.Series | float:
-
-        if isinstance(dt_series, pd.Series):
-            delta = pd.to_datetime(dt_series) - TIME_ZERO
-            delta_in_days = delta.dt.total_seconds() / (24 * 3600)
-        elif isinstance(dt_series, pd.Timestamp):
-            delta = pd.to_datetime(dt_series) - TIME_ZERO
-            delta_in_days = delta.total_seconds() / (24 * 3600)
-        else:
-            raise ValueError(
-                f"Received type {type(delta)}, expected pd.Series or pd.Timedelta"
-            )
-        return delta_in_days
+    MIN_TIME = check_ins["arrival_time"].min()
+    MAX_TIME = check_ins["arrival_time"].max()
 
     # Build POI graph (built from train_df)
     print("Loading POI graph...")
@@ -185,7 +187,7 @@ def train(args):
                     # Ger POIs idx in this trajectory
                     poi_idxs = traj_df["place_id"].to_list()
                     time_feature = datetime_to_float(
-                        traj_df[args.time_feature]
+                        traj_df[args.time_feature], MIN_TIME, MAX_TIME
                     ).to_list()
 
                     # Construct input seq and label seq
@@ -229,7 +231,7 @@ def train(args):
                     # Ger POIs idx in this trajectory
                     poi_idxs = traj_df["place_id"].to_list()
                     time_feature = datetime_to_float(
-                        traj_df[args.time_feature]
+                        traj_df[args.time_feature], MIN_TIME, MAX_TIME
                     ).to_list()
 
                     # Construct input seq and label seq
@@ -361,15 +363,19 @@ def train(args):
     )
 
     # Define overall loss and optimizer
-    optimizer = optim.Adam(
-        params=list(poi_embed_model.parameters())
+    trainable_params = (
+        list(poi_embed_model.parameters())
         + list(node_attn_model.parameters())
         + list(user_embed_model.parameters())
         + list(time_embed_model.parameters())
         + list(cat_embed_model.parameters())
         + list(embed_fuse_model1.parameters())
         + list(embed_fuse_model2.parameters())
-        + list(seq_model.parameters()),
+        + list(seq_model.parameters())
+    )
+
+    optimizer = optim.Adam(
+        params=trainable_params,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -424,58 +430,6 @@ def train(args):
 
         return input_seq_embed
 
-    def adjust_pred_prob_by_graph(y_pred_poi):
-        """Adjust logits using sparse edge-based attention without dense NxN maps."""
-        # Compute sparse attention on edges
-        attn_sparse = node_attn_model(X, A_sparse_torch)  # sparse [N, N]
-
-        # Build padded index tensor for input POIs
-        idx_tensors = [torch.LongTensor(seq) for seq in batch_input_seqs]
-        if len(idx_tensors) == 0:
-            return y_pred_poi
-
-        batch_input_idx = pad_sequence(
-            idx_tensors, batch_first=True, padding_value=-1
-        ).to(device=args.device)
-        valid_mask = batch_input_idx != -1
-        if not valid_mask.any():
-            return y_pred_poi
-
-        # Flatten valid positions and their coordinates
-        pos_bt = valid_mask.nonzero(as_tuple=False)  # [K, 2]
-        srcs = batch_input_idx[valid_mask]  # [K]
-
-        # CSR-like grouping of edges by source
-        idx = attn_sparse.indices()  # [2, E]
-        vals = attn_sparse.values()  # [E]
-        src_idx = idx[0]
-        dst_idx = idx[1]
-
-        num_nodes = X.shape[0]
-        counts = torch.bincount(src_idx, minlength=num_nodes)
-        rowptr = torch.empty(num_nodes + 1, dtype=torch.long, device=counts.device)
-        rowptr[0] = 0
-        torch.cumsum(counts, dim=0, out=rowptr[1:])
-
-        unique_srcs = torch.unique(srcs)
-        for s in unique_srcs.tolist():
-            s = int(s)
-            start = rowptr[s].item()
-            end = rowptr[s + 1].item()
-            if start == end:
-                continue
-            dests = dst_idx[start:end]
-            w = vals[start:end]
-
-            mask_s = srcs == s
-            bt_list = pos_bt[mask_s]
-            for k in range(bt_list.size(0)):
-                b = bt_list[k, 0]
-                t = bt_list[k, 1]
-                y_pred_poi[b, t].index_add_(0, dests, w)
-
-        return y_pred_poi
-
     # %% ====================== Train ======================
     poi_embed_model = poi_embed_model.to(device=args.device)
     node_attn_model = node_attn_model.to(device=args.device)
@@ -489,7 +443,7 @@ def train(args):
     # %% Loop epoch
 
     for epoch in range(args.epochs):
-        logging.info(f"{'*' * 50}Epoch:{epoch:03d}{'*' * 50}\n")
+        logging.info(f"{'*' * 25} Epoch: {epoch+1} / {args.epochs} {'*' * 25}")
         poi_embed_model.train()
         node_attn_model.train()
         user_embed_model.train()
@@ -499,13 +453,25 @@ def train(args):
         embed_fuse_model2.train()
         seq_model.train()
 
-        src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
+        # Mask will be (re)built per-batch using actual seq_len
+        src_mask = None
         # Loop batch
-        for batch in tqdm(train_loader, desc="Training", ncols=80):
-            if len(batch) != args.batch:
-                src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(
-                    args.device
-                )
+        pbar = tqdm(train_loader, desc="Training", ncols=80)
+        for batch in pbar:
+            # Build inputs and masks from the batch's actual sequence length
+
+            # Assert no nan in batch
+            for sample in batch:
+                input_seq = [each[0] for each in sample[1]]
+                label_seq = [each[0] for each in sample[2]]
+                input_seq_time = [each[1] for each in sample[1]]
+                label_seq_time = [each[1] for each in sample[2]]
+                assert (
+                    not any(pd.isna(input_seq))
+                    and not any(pd.isna(label_seq))
+                    and not any(pd.isna(input_seq_time))
+                    and not any(pd.isna(label_seq_time))
+                ), f"NaN detected in batch data: {sample[0]}"
 
             # For padding
             batch_input_seqs = []
@@ -526,8 +492,9 @@ def train(args):
                 input_seq_time = [each[1] for each in sample[1]]
                 label_seq_time = [each[1] for each in sample[2]]
                 label_seq_cats = [poi_idx2cat_idx_dict[each] for each in label_seq]
+                # input_seq_embed shape: [seq_len, embed_dim]
                 input_seq_embed = torch.stack(
-                    input_traj_to_embeddings(sample, poi_embeddings)
+                    input_traj_to_embeddings(sample, poi_embeddings), dim=0
                 )
                 batch_seq_embeds.append(input_seq_embed)
                 batch_seq_lens.append(len(input_seq))
@@ -537,6 +504,7 @@ def train(args):
                 batch_seq_labels_cat.append(torch.LongTensor(label_seq_cats))
 
             # Pad seqs for batch training
+            # batch_padded shape: [batch, seq, embed_dim]
             batch_padded = pad_sequence(
                 batch_seq_embeds, batch_first=True, padding_value=-1
             )
@@ -550,30 +518,165 @@ def train(args):
                 batch_seq_labels_cat, batch_first=True, padding_value=-1
             )
 
+            # Build key padding mask: True where all features are padding (-1)
+            pad_mask = (batch_padded == -1).all(dim=2)  # [batch, seq]
+
+            # Skip batch if everything is padded across all targets (avoids NaN losses)
+            has_poi = (label_padded_poi != -1).any().item()
+            has_time = (
+                ((label_padded_time != -1) & torch.isfinite(label_padded_time))
+                .any()
+                .item()
+            )
+            has_cat = (label_padded_cat != -1).any().item()
+            if not (has_poi or has_time or has_cat):
+                # Nothing to learn in this batch
+                continue
+
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
+            # Zero padded positions to avoid injecting padding values into FFN/residuals
+            if pad_mask.any():
+                x[pad_mask.unsqueeze(-1).expand_as(x)] = 0.0
             y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
             y_time = label_padded_time.to(device=args.device, dtype=torch.float)
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
-            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
 
-            # Graph Attention adjusted prob
-            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
+            seq_len = x.size(1)
+            src_mask = torch.nn.Transformer.generate_square_subsequent_mask(
+                seq_len, args.device, dtype=torch.bool
+            )
+            key_padding_mask = pad_mask.to(args.device)  # [batch, seq]
 
-            loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
-            loss_time = criterion_time(torch.squeeze(y_pred_time), y_time)
-            loss_cat = criterion_cat(y_pred_cat.transpose(1, 2), y_cat)
+            if torch.isnan(x).any():
+                raise ValueError("NaN detected in input x (transposed).")
+            if torch.isnan(y_poi).any():
+                raise ValueError("NaN detected in label y_poi.")
+            if torch.isnan(y_time).any():
+                raise ValueError("NaN detected in label y_time.")
+            if torch.isnan(y_cat).any():
+                raise ValueError("NaN detected in label y_cat.")
+            if torch.isnan(src_mask).any():
+                raise ValueError("NaN detected in src_mask.")
+
+            y_pred_poi, y_pred_time, y_pred_cat = seq_model(
+                x, src_mask, key_padding_mask
+            )
+
+            # Assert no nan in predictions
+            if torch.isnan(y_pred_poi).any():
+                raise ValueError("NaN detected in prediction y_pred_poi.")
+            if torch.isnan(y_pred_time).any():
+                raise ValueError("NaN detected in prediction y_pred_time.")
+            if torch.isnan(y_pred_cat).any():
+                raise ValueError("NaN detected in prediction y_pred_cat.")
+
+            valid_positions = ~key_padding_mask
+
+            flat_valid_poi = (valid_positions & (y_poi != -1)).view(-1)
+            flat_valid_time = (
+                valid_positions & (y_time != -1) & torch.isfinite(y_time)
+            ).view(-1)
+            flat_valid_cat = (valid_positions & (y_cat != -1)).view(-1)
+
+            flat_pred_poi = y_pred_poi.view(-1, y_pred_poi.size(-1))
+            flat_y_poi = y_poi.view(-1)
+            flat_pred_time = y_pred_time.view(-1)
+            flat_y_time = y_time.view(-1)
+            flat_pred_cat = y_pred_cat.view(-1, y_pred_cat.size(-1))
+            flat_y_cat = y_cat.view(-1)
+
+            if not flat_valid_poi.any():
+                # Should not happen because we skip empty batches above, but guard anyway
+                continue
+
+            loss_poi = criterion_poi(
+                flat_pred_poi[flat_valid_poi], flat_y_poi[flat_valid_poi]
+            )
+            if flat_valid_time.any():
+                loss_time = criterion_time(
+                    flat_pred_time[flat_valid_time], flat_y_time[flat_valid_time]
+                )
+            else:
+                loss_time = flat_pred_time.new_tensor(0.0)
+
+            if flat_valid_cat.any():
+                loss_cat = criterion_cat(
+                    flat_pred_cat[flat_valid_cat], flat_y_cat[flat_valid_cat]
+                )
+            else:
+                loss_cat = flat_pred_cat.new_tensor(0.0)
 
             # Final loss
             loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
             optimizer.zero_grad()
-            loss.backward(retain_graph=True)
+            try:
+                loss.backward()
+            except RuntimeError as err:
+                if "ScaledDotProduct" in str(err):
+                    logging.error("ScaledDotProduct attention backward failed: %s", err)
+                    logging.error(
+                        "x abs max %.4e | abs mean %.4e",
+                        x.abs().max().item(),
+                        x.abs().mean().item(),
+                    )
+                    logging.error(
+                        "y_pred_poi abs max %.4e",
+                        y_pred_poi.abs().max().item(),
+                    )
+                    logging.error(
+                        "src_mask finite=%s min=%s max=%s",
+                        (
+                            torch.isfinite(src_mask).all().item()
+                            if src_mask is not None
+                            else True
+                        ),
+                        src_mask.min().item() if src_mask is not None else 0.0,
+                        src_mask.max().item() if src_mask is not None else 0.0,
+                    )
+                    logging.error(
+                        "key_padding_mask true_count=%d",
+                        int(key_padding_mask.sum().item()),
+                    )
+                raise
+            # Additional clipping by value as an extra safety guard
+            torch.nn.utils.clip_grad_value_(trainable_params, clip_value=5.0)
+            # Clip gradients to avoid rare spikes causing NaNs
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+
+            # Check gradients for debugging
+            params_with_nan_grad = []
+            for name, param in seq_model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        params_with_nan_grad.append(name)
+            if params_with_nan_grad:
+                raise ValueError(
+                    f"After backward: NaN detected in gradient of parameter: {params_with_nan_grad}"
+                )
+
             optimizer.step()
+
             step += 1
             run.log({"train/loss": loss.item()}, step=step)
-
-            # break  # For debugging, remove this in real training
+            pbar.set_postfix({"loss": loss.item()})
+        pbar.close()
         # train end --------------------------------------------------------------------------------------------------------
+
+        # If no val data, directly save embeddings and skip val
+        if args.train_ratio + 1e-5 >= 1.0:
+            if not torch.isnan(loss):
+                # Save epoch embeddings
+                poi_embeddings = poi_embed_model(X, A_sparse_torch).detach().cpu()
+                embeddings = {
+                    idx: poi_embeddings[idx] for idx in range(len(poi_embeddings))
+                }
+                torch.save(embeddings, f"output/{run.name}.pt")
+            else:
+                raise ValueError(
+                    "NaN detected in training loss, aborting saving embeddings."
+                )
+            continue
 
         poi_embed_model.eval()
         node_attn_model.eval()
@@ -584,13 +687,7 @@ def train(args):
         embed_fuse_model2.eval()
         seq_model.eval()
 
-        src_mask = seq_model.generate_square_subsequent_mask(args.batch).to(args.device)
         for batch in tqdm(val_loader, desc="Validation", ncols=80):
-            if len(batch) != args.batch:
-                src_mask = seq_model.generate_square_subsequent_mask(len(batch)).to(
-                    args.device
-                )
-
             # For padding
             batch_input_seqs = []
             batch_seq_lens = []
@@ -633,25 +730,74 @@ def train(args):
                 batch_seq_labels_cat, batch_first=True, padding_value=-1
             )
 
+            # Build key padding mask
+            pad_mask = (batch_padded == -1).all(dim=2)  # [batch, seq]
+
+            # Skip batch if everything is padded across all targets
+            has_poi = (label_padded_poi != -1).any().item()
+            has_time = (
+                ((label_padded_time != -1) & torch.isfinite(label_padded_time))
+                .any()
+                .item()
+            )
+            has_cat = (label_padded_cat != -1).any().item()
+            if not (has_poi or has_time or has_cat):
+                continue
+
             # Feedforward
             x = batch_padded.to(device=args.device, dtype=torch.float)
+            if pad_mask.any():
+                x[pad_mask.unsqueeze(-1).expand_as(x)] = 0.0
             y_poi = label_padded_poi.to(device=args.device, dtype=torch.long)
             y_time = label_padded_time.to(device=args.device, dtype=torch.float)
             y_cat = label_padded_cat.to(device=args.device, dtype=torch.long)
-            y_pred_poi, y_pred_time, y_pred_cat = seq_model(x, src_mask)
-
-            # Graph Attention adjusted prob
-            y_pred_poi_adjusted = adjust_pred_prob_by_graph(y_pred_poi)
+            seq_len = x.size(1)
+            src_mask = torch.nn.Transformer.generate_square_subsequent_mask(
+                seq_len, args.device, dtype=torch.bool
+            )
+            key_padding_mask = pad_mask.to(args.device)
+            y_pred_poi, y_pred_time, y_pred_cat = seq_model(
+                x, src_mask, key_padding_mask
+            )
 
             # Calculate loss
-            loss_poi = criterion_poi(y_pred_poi_adjusted.transpose(1, 2), y_poi)
-            loss_time = criterion_time(torch.squeeze(y_pred_time), y_time)
-            loss_cat = criterion_cat(y_pred_cat.transpose(1, 2), y_cat)
+            valid_positions = ~key_padding_mask
+            flat_valid_poi = (valid_positions & (y_poi != -1)).view(-1)
+            flat_valid_time = (
+                valid_positions & (y_time != -1) & torch.isfinite(y_time)
+            ).view(-1)
+            flat_valid_cat = (valid_positions & (y_cat != -1)).view(-1)
+
+            flat_pred_poi = y_pred_poi.view(-1, y_pred_poi.size(-1))
+            flat_y_poi = y_poi.view(-1)
+            flat_pred_time = y_pred_time.view(-1)
+            flat_y_time = y_time.view(-1)
+            flat_pred_cat = y_pred_cat.view(-1, y_pred_cat.size(-1))
+            flat_y_cat = y_cat.view(-1)
+
+            if flat_valid_poi.any():
+                loss_poi = criterion_poi(
+                    flat_pred_poi[flat_valid_poi], flat_y_poi[flat_valid_poi]
+                )
+            else:
+                loss_poi = flat_pred_poi.new_tensor(0.0)
+
+            if flat_valid_time.any():
+                loss_time = criterion_time(
+                    flat_pred_time[flat_valid_time], flat_y_time[flat_valid_time]
+                )
+            else:
+                loss_time = flat_pred_time.new_tensor(0.0)
+
+            if flat_valid_cat.any():
+                loss_cat = criterion_cat(
+                    flat_pred_cat[flat_valid_cat], flat_y_cat[flat_valid_cat]
+                )
+            else:
+                loss_cat = flat_pred_cat.new_tensor(0.0)
             loss = loss_poi + loss_time * args.time_loss_weight + loss_cat
 
             run.log({"val/loss": loss.item()}, step=step)
-
-            # break  # For debugging, remove this in real training
         # valid end --------------------------------------------------------------------------------------------------------
 
         # Save best epoch embeddings
@@ -664,8 +810,6 @@ def train(args):
                 idx: poi_embeddings[idx] for idx in range(len(poi_embeddings))
             }
             torch.save(embeddings, f"output/{run.name}.pt")
-
-        # break  # For debugging, remove this in real training
 
 
 if __name__ == "__main__":

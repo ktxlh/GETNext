@@ -117,7 +117,11 @@ def calculate_laplacian_matrix(adj_mat, mat_type="hat_rw_normd_lap_mat"):
 
 def maksed_mse_loss(input, target, mask_value=-1):
     mask = target == mask_value
-    out = (input[~mask] - target[~mask]) ** 2
+    valid = ~mask
+    if valid.sum() == 0:
+        # No valid targets; return a safe zero loss to avoid NaNs
+        return input.new_tensor(0.0)
+    out = (input[valid] - target[valid]) ** 2
     loss = out.mean()
     return loss
 

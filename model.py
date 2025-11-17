@@ -1,4 +1,5 @@
 import math
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -202,9 +203,10 @@ class Time2Vec(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=500):
+    def __init__(self, d_model, dropout=0.1, max_len=500, batch_first=False):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
+        self.batch_first = batch_first
 
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
@@ -213,11 +215,18 @@ class PositionalEncoding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
         self.register_buffer("pe", pe)
 
     def forward(self, x):
-        x = x + self.pe[: x.size(0), :]
+        pe = cast(torch.Tensor, self.pe)
+        if pe is None:
+            raise RuntimeError("Positional encoding buffer is not initialized.")
+
+        if self.batch_first:
+            x = x + pe[:, : x.size(1), :]
+        else:
+            x = x + pe[:, : x.size(0), :].transpose(0, 1)
         return self.dropout(x)
 
 
@@ -227,34 +236,29 @@ class TransformerModel(nn.Module):
         from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
         self.model_type = "Transformer"
-        self.pos_encoder = PositionalEncoding(embed_size, dropout)
-        encoder_layers = TransformerEncoderLayer(embed_size, nhead, nhid, dropout)
+        self.pos_encoder = PositionalEncoding(embed_size, dropout, batch_first=True)
+        encoder_layers = TransformerEncoderLayer(
+            embed_size, nhead, nhid, dropout, batch_first=True
+        )
         self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
-        # self.encoder = nn.Embedding(num_poi, embed_size)
         self.embed_size = embed_size
         self.decoder_poi = nn.Linear(embed_size, num_poi)
         self.decoder_time = nn.Linear(embed_size, 1)
         self.decoder_cat = nn.Linear(embed_size, num_cat)
         self.init_weights()
 
-    def generate_square_subsequent_mask(self, sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = (
-            mask.float()
-            .masked_fill(mask == 0, float("-inf"))
-            .masked_fill(mask == 1, float(0.0))
-        )
-        return mask
-
     def init_weights(self):
         initrange = 0.1
         self.decoder_poi.bias.data.zero_()
         self.decoder_poi.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, src, src_mask):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        """Forward expects src shape [batch, seq_len, embed]."""
         src = src * math.sqrt(self.embed_size)
         src = self.pos_encoder(src)
-        x = self.transformer_encoder(src, src_mask)
+        x = self.transformer_encoder(
+            src, mask=src_mask, src_key_padding_mask=src_key_padding_mask
+        )
         out_poi = self.decoder_poi(x)
         out_time = self.decoder_time(x)
         out_cat = self.decoder_cat(x)
